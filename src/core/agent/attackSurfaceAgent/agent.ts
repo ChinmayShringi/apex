@@ -14,6 +14,7 @@ import { z } from 'zod';
 import { join } from 'path';
 import { writeFileSync, mkdirSync, existsSync } from 'fs';
 import { detectOSAndEnhancePrompt } from '../utils';
+import { startAgentTrace, endAgentTrace, recordStep, type TraceHandle } from '../telemetry/weave';
 
 export interface RunAgentProps {
   target: string;
@@ -22,6 +23,7 @@ export interface RunAgentProps {
   onStepFinish?: StreamTextOnStepFinishCallback<ToolSet>;
   abortSignal?: AbortSignal;
   session?: Session;
+  parentTraceId?: string;
 }
 
 export interface RunAgentResult extends StreamTextResult<ToolSet, never> {
@@ -244,6 +246,24 @@ You MUST provide the details final report using create_attack_surface_report too
 
   const systemPrompt = detectOSAndEnhancePrompt(SYSTEM);
 
+  const traceHandlePromise: Promise<TraceHandle> = startAgentTrace({
+    traceName: "attack-surface_stream",
+    agentType: "attack-surface",
+    model,
+    session,
+    target,
+    objective: opts.objective,
+    parentTraceId: opts.parentTraceId,
+    extra: {
+      mode: "sub-agent",
+      parentAgentType: "thorough-pentest",
+      tools: ['analyze_scan', 'document_asset', 'execute_command', 'http_request', 'create_attack_surface_report'],
+    },
+  });
+
+  const start = Date.now();
+  let stepCount = 0;
+
   const streamResult = streamResponse({
     prompt: enhancedPrompt,
     system: systemPrompt,
@@ -256,13 +276,63 @@ You MUST provide the details final report using create_attack_surface_report too
       create_attack_surface_report,
     },
     stopWhen: stepCountIs(10000),
-    toolChoice: 'auto', // Let the model decide when to use tools vs respond
-    onStepFinish,
+    toolChoice: 'auto',
+    onStepFinish: async (step) => {
+      stepCount += 1;
+
+      // Preserve existing behavior
+      if (onStepFinish) {
+        await onStepFinish(step);
+      }
+
+      // Send to Weave as a child "step" event (trace handle will be ready by the time this is called)
+      const traceHandle = await traceHandlePromise;
+      await recordStep(traceHandle, {
+        stepIndex: stepCount,
+        stepType: step.toolResults && step.toolResults.length > 0 ? "tool" : "message",
+        rawStep: step,
+      });
+    },
     abortSignal,
   });
+
+  // Finalize trace when stream completes (run in background, don't block return)
+  (async () => {
+    try {
+      // Wait for stream to complete
+      await streamResult.text;
+
+      const durationMs = Date.now() - start;
+      const traceHandle = await traceHandlePromise;
+
+      await endAgentTrace(traceHandle, {
+        input: {
+          target,
+          objective: opts.objective,
+          tools: ['analyze_scan', 'document_asset', 'execute_command', 'http_request', 'create_attack_surface_report'],
+          systemPrompt,
+          prompt: enhancedPrompt,
+        },
+        output: {
+          messages: streamResult.messages,
+        },
+        stats: {
+          stepCount,
+          durationMs,
+          tokenUsage: (streamResult as any).tokenUsage ?? null,
+        },
+      });
+    } catch (err) {
+      // Silently fail trace finalization to not break the agent
+      console.error("Failed to finalize trace:", err);
+    }
+  })();
 
   // Attach the session directly to the stream result object
   (streamResult as any).session = session;
 
-  return { streamResult: streamResult as RunAgentResult, session };
+  return {
+    streamResult: streamResult as RunAgentResult,
+    session
+  };
 }
