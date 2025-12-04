@@ -314,7 +314,8 @@ You MUST provide the details final report using create_attack_surface_report too
           prompt: enhancedPrompt,
         },
         output: {
-          messages: streamResult.messages,
+          // StreamTextResult doesn't have messages directly, get from text property
+          text: await streamResult.text,
         },
         stats: {
           stepCount,

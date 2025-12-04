@@ -105,7 +105,7 @@ export async function startAgentTrace(ctx: AgentTraceContext): Promise<TraceHand
     );
 
     // Call it and get the call reference for nesting
-    const result = await tracedFn.call(meta);
+    const result = await tracedFn(meta);
 
     // Try to get the call ID if available
     if (result && typeof result === 'object' && 'id' in result) {
