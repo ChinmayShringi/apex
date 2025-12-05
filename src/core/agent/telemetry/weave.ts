@@ -54,6 +54,8 @@ export type TraceHandle = {
   opName: string;
   traceId?: string;
   callId?: string; // Weave call ID for parent-child relationships
+  // Helper to wrap child operations so they nest under the parent
+  wrapOp?: <T>(name: string, fn: () => Promise<T>) => Promise<T>;
   meta: {
     agentType: string;
     sessionId: string;
@@ -111,21 +113,39 @@ export async function startAgentTrace(ctx: AgentTraceContext): Promise<TraceHand
     if (result && typeof result === 'object' && 'id' in result) {
       callId = (result as any).id;
     }
+
+    // Create a helper that wraps child operations with weave.op
+    // This ensures they get tracked as nested operations
+    const wrapOp = async <T,>(name: string, fn: () => Promise<T>): Promise<T> => {
+      const childOp = weave.op(fn, { name });
+      return await childOp();
+    };
+
+    return {
+      enabled: true,
+      opName: ctx.traceName,
+      callId,
+      wrapOp,
+      meta: {
+        agentType: ctx.agentType,
+        sessionId: ctx.session.id,
+        target: ctx.target,
+        companyId: (ctx.session as any).companyId,
+      },
+    };
   } catch (error) {
     // Silent fail to not break execution
+    return {
+      enabled: false,
+      opName: ctx.traceName,
+      meta: {
+        agentType: ctx.agentType,
+        sessionId: ctx.session.id,
+        target: ctx.target,
+        companyId: (ctx.session as any).companyId,
+      },
+    };
   }
-
-  return {
-    enabled: true,
-    opName: ctx.traceName,
-    callId,
-    meta: {
-      agentType: ctx.agentType,
-      sessionId: ctx.session.id,
-      target: ctx.target,
-      companyId: (ctx.session as any).companyId,
-    },
-  };
 }
 
 export async function endAgentTrace(
@@ -170,19 +190,32 @@ export async function recordStep(handle: TraceHandle, step: StepPayload): Promis
   await ensureWeaveInit();
 
   try {
-    const tracedFn = weave.op(
-      async function (data: any) {
-        return data;
-      },
-      { name: `${handle.opName}_step` }
-    );
+    // Use wrapOp if available for proper nesting, otherwise create standalone op
+    if (handle.wrapOp) {
+      await handle.wrapOp(`${handle.opName}_step_${step.stepIndex}`, async () => {
+        return {
+          stepIndex: step.stepIndex,
+          stepType: step.stepType,
+          rawStep: step.rawStep,
+        };
+      });
+    } else {
+      const tracedFn = weave.op(
+        async function step(data: any) {
+          return data;
+        },
+        { name: `${handle.opName}_step_${step.stepIndex}` }
+      );
 
-    await tracedFn({
-      parent: handle.meta,
-      stepIndex: step.stepIndex,
-      stepType: step.stepType,
-      rawStep: step.rawStep,
-    });
+      await tracedFn({
+        parent: handle.opName,
+        parentCallId: handle.callId,
+        parentMeta: handle.meta,
+        stepIndex: step.stepIndex,
+        stepType: step.stepType,
+        rawStep: step.rawStep,
+      });
+    }
   } catch (error) {
     // Silent fail
   }
@@ -198,19 +231,32 @@ export async function recordToolCall(
   await ensureWeaveInit();
 
   try {
-    const tracedFn = weave.op(
-      async function (data: any) {
-        return data;
-      },
-      { name: `${handle.opName}_tool_${payload.toolName}` }
-    );
+    // Use wrapOp if available for proper nesting, otherwise create standalone op
+    if (handle.wrapOp) {
+      await handle.wrapOp(`${handle.opName}_tool_${payload.toolName}`, async () => {
+        return {
+          toolName: payload.toolName,
+          args: payload.args,
+          result: payload.result,
+        };
+      });
+    } else {
+      const tracedFn = weave.op(
+        async function tool(data: any) {
+          return data;
+        },
+        { name: `${handle.opName}_tool_${payload.toolName}` }
+      );
 
-    await tracedFn({
-      parent: handle.meta,
-      toolName: payload.toolName,
-      args: payload.args,
-      result: payload.result,
-    });
+      await tracedFn({
+        parent: handle.opName,
+        parentCallId: handle.callId,
+        parentMeta: handle.meta,
+        toolName: payload.toolName,
+        args: payload.args,
+        result: payload.result,
+      });
+    }
   } catch (error) {
     // Silent fail
   }
